@@ -77,29 +77,32 @@ STM_ref = STM_ref(:, 1:6, 1:6);
 % Preallocate structure arrays
 num_steps_true = length(t_true);
 num_steps_ref = length(t_ref);
-trajectory_true = struct('time', cell(1, num_steps_true), 'state', ...
-    cell(1, num_steps_true), 'STM', cell(1, num_steps_true));
+trajectory_true = struct('time', cell(1, num_steps_ref), 'state', ...
+    cell(1, num_steps_ref), 'STM', cell(1, num_steps_ref), ...
+    'parameters', cell(1, num_steps_ref),'function_handle', cell(1, num_steps_ref));
 trajectory_ref = struct('time', cell(1, num_steps_ref), 'state', ...
-    cell(1, num_steps_ref), 'STM', cell(1, num_steps_ref));
+    cell(1, num_steps_ref), 'STM', cell(1, num_steps_ref), ...
+    'parameters', cell(1, num_steps_ref),'function_handle', cell(1, num_steps_ref));
 
 % Fill the true trajectory structure
 for i = 1:num_steps_true
     trajectory_true(i).time = t_true(i);
     trajectory_true(i).state = state_true(i, 1:6); % Extract r, v
+    trajectory_true(i).parameters = state_true(i, 7:9); % Extract mu, J1, J2
     trajectory_true(i).STM = STM_true(i, :, :);
-    trajectory_true(i).function_handle = @(t, x) zonalSPH_ODE(t, x, coeffs, mu, l_max, acc_func, A_func);
+    trajectory_true(i).function_handle = @(t, x) zonalSPH_ODE(t, ...
+        x, coeffs, mu, l_max, acc_func, A_func);
 end
 
 % Fill the reference trajectory structure
 for i = 1:num_steps_ref
     trajectory_ref(i).time = t_ref(i);
     trajectory_ref(i).state = state_ref(i, 1:6); % Extract r, v
+    trajectory_ref(i).parameters = state_ref(i, 7:9); % Extract mu, J1, J2
     trajectory_ref(i).STM = STM_ref(i, :, :);
+    trajectory_ref(i).function_handle = @(t, x) zonalSPH_ODE(t, ...
+        x, coeffs, mu, l_max, acc_func, A_func);
 end
-
-% Save to .MAT file
-save('trajectory_true_STM.mat', 'trajectory_true');
-save('trajectory_ref_STM.mat', 'trajectory_ref');
 
 %% Create Measurements 
 
@@ -139,7 +142,6 @@ end
 % Merge and sort measurements across all stations
 station_names = {'GS1', 'GS2', 'GS3'};
 sorted_measurements = merge_and_sort_measurements(measurements_cell, station_names);
-save('sorted_measurements.mat', 'sorted_measurements');
 
 %% Plot Measurements Residuals
 
@@ -205,7 +207,7 @@ P0 = diag([sigma_pos^2, sigma_pos^2, sigma_pos^2, ...
            sigma_vel^2, sigma_vel^2, sigma_vel^2]);
 
 % Run the Linearized Kalman Filter
-results = batch_filter(trajectory_ref, sorted_measurements, P0);
+results = ekf(trajectory_ref, sorted_measurements, P0);
 
 % Print Results
 compute_rms_errors(results)
@@ -571,7 +573,7 @@ function sorted_measurements = merge_and_sort_measurements(measurements_cell, st
             stacked_covariance = [stacked_covariance; ...
                 all_measurements(j).covariance]; %#ok<AGROW>
             stacked_measurement_func = [stacked_measurement_func; ...
-                func2str(all_measurements(j).measurement_function)]; %#ok<AGROW>
+                all_measurements(j).measurement_function]; %#ok<AGROW>
             stacked_labels = [stacked_labels; 
                               sprintf('%s - Range', all_measurements(j).station_name);
                               sprintf('%s - Range Rate', all_measurements(j).station_name)];  %#ok<AGROW>
@@ -992,6 +994,117 @@ function compute_rms_errors(results)
         fprintf('Residual %d: %.14e\n', i, rms_residuals_trimmed(i));
     end
 end
+
+function results = ekf(trajectory_ref, sorted_measurements, P0)
+    % Extract state and parameter dimensions dynamically
+    n = size(trajectory_ref(1).state, 1);                   % Number of state variables 
+    n_par = size(trajectory_ref(1).parameters, 1);          % Number of parameters in f(x)
+    n_full = n + n_par;                                     % Number of total variables in f(x)
+
+    % TODO: initialize with LKF!
+
+    % Initialization
+    T = length(sorted_measurements); % Number of measurements
+    max_m = max(arrayfun(@(s) length(s.residual), sorted_measurements));
+
+    state_corrected_hist = zeros(n, T);  % Corrected state estimates
+    state_deviation_hist = zeros(n, T);  % Cumulative state deviations
+    P_hist = zeros(n, n, T);
+    postfit_residuals = NaN(max_m, T);  % Preallocate with NaN
+
+    % Extract trajectory times for reference
+    trajectory_times = [trajectory_ref.time];
+
+    % Find indices of trajectory points that match measurement times
+    measurement_times = [sorted_measurements.time];
+    [~, traj_indices] = ismember(measurement_times, trajectory_times);
+
+    % Initial state estimate (from first trajectory reference)
+    x0 = trajectory_ref(traj_indices(1)).state(:);
+    par0 = trajectory_ref(traj_indices(1)).parameters(:);
+    STM0 = eye(n_full);  % Initial STM
+    x_aug = [x0; par0; STM0(:)];  % Augmented state with STM
+    P = P0;  % Initial covariance
+
+    % ODE options for propagation
+    ode_options = odeset('RelTol', 1e-12, 'AbsTol', 1e-12);
+
+    % Progress tracking
+    fprintf('EKF Progress: 0%%');
+
+    % EKF loop over measurements
+    for t = 1:T
+        % Extract measurement time
+        t_now = measurement_times(t);
+        if t > 1
+            t_prev = measurement_times(t - 1);
+        else
+            t_prev = trajectory_times(1);
+        end
+
+        % Extract stored function handle for state propagation
+        traj_idx = traj_indices(t);
+        propagate_func = trajectory_ref(traj_idx).function_handle;
+
+        % Propagate Dynamics
+        t_span = [t_prev, t_now];  % Propagate to next measurement time
+        [~, x_propagated] = ode113(@(t, x) propagate_func(t, x), t_span,...
+            x_aug, ode_options);
+
+        % Extract STM (skip parameters)
+        STM_t = reshape(x_propagated(end, n_full + 1:end)', n_full, n_full); 
+        STM_t = STM_t(1:n, 1:n);
+
+        % Prediction Step
+        x_pred = x_propagated(end, 1:n)';  
+        P_pred = STM_t * P * STM_t' + Q;
+
+        % Extract Measurement Model Function Handle and Covariance
+        [h_func, H_func]  = sorted_measurements(t).measurement_func;
+        R = diag(sorted_measurements(t).covariance);
+
+        % Compute Computed Measurement and Partial
+        h_pred = h_func(x_pred_state); 
+        H_tilde = H_func(x_pred_state);  
+
+        % Compute postfit-fit residual
+        observed_measurement = sorted_measurements(t).observed;
+        postfit_res = observed_measurement - h_pred;
+
+        % Kalman Gain computation
+        S = H_tilde * P_pred * H_tilde' + R;
+        K = P_pred * H_tilde' / S;
+
+        % Update Step
+        dx_upd = K * postfit_res;
+        x_upd = x_pred + dx_upd;
+        P_upd = (eye(n) - K * H_tilde) * P_pred * (eye(n) - K * H_tilde)' + K * R * K';
+
+        % Store results
+        state_corrected_hist(:, t) = x_upd;
+        state_deviation_hist(:, t) = dx_upd; 
+        P_hist(:, :, t) = P_upd;
+        postfit_residuals(1:length(prefit_residual), t) = postfit_res;
+
+        % Update for next iteration
+        x_aug = [x_upd; par0; STM0(:)];  % Update augmented state for next step
+        P = P_upd;
+
+        % Print progress
+        fprintf('\b\b\b\b%3d%%', round((t / T) * 100));
+    end
+
+    fprintf('\nEKF Completed!\n');
+
+    % Store all outputs in a struct (dictionary)
+    results = struct(...
+        'state_corrected_hist', state_corrected_hist, ...
+        'state_deviation_hist', state_deviation_hist, ... 
+        'P_hist', P_hist, ...
+        'postfit_residuals', postfit_residuals ...
+    );
+end
+
 
 
 
