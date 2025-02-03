@@ -31,7 +31,7 @@ state0 = [state0; mu; 0; coeffs(end); reshape(eye(9), [], 1)]; % Adding mu, J1, 
 dr0 = 1e-3; % Initial position deviation (km)
 dv0 = 1e-6; % Initial velocity deviation (km/sec)
 delta_x0 = [dr0; 0; 0; 0; dv0; 0; 0; 0; 0]; % Initial perturbation 
-state_refurbed0 = state0 + [delta_x0; zeros(81, 1)];
+state_perturbed0 = state0 + [delta_x0; zeros(81, 1)];
 
 % Initialize ODEs
 [acc_func, A_func] = precomputeZonalSPH(R, l_max);
@@ -49,10 +49,10 @@ options = odeset('RelTol', 2.22045 * 1e-14, 'AbsTol',  2.22045 * 1e-14);
 % Integrate perturbed trajectory with STM
 [t_ref, state_ref] = ode45(@(t, state) ...
      zonalSPH_ODE(t, state, coeffs,  mu, l_max, acc_func, A_func), ...
-     t_span, state_refurbed0, options);
+     t_span, state_perturbed0, options);
 
 % Plot Orbit
-figure(1);
+gca1 = figure(1);
 plot3(state_true(:, 1), state_true(:, 2), state_true(:, 3), 'b', 'LineWidth', 2);  
 hold on;  
 plot3(state_ref(:, 1), state_ref(:, 2), state_ref(:, 3), ...
@@ -65,6 +65,8 @@ zlabel('z (km)', 'Interpreter', 'latex', 'FontSize', 14);
 legend('Trajectory True', 'Trajectory Reference (Perturbed)', 'Earth', ...
     'Location', 'northwest', 'Interpreter', 'latex','FontSize', 14);
 grid on;
+exportgraphics(gca1, 'Orbit_trajectories.pdf', 'ContentType','image',...
+    'Resolution', 1000);
 
 %% Extract True and Reference States, and STM Matrices
 
@@ -150,7 +152,7 @@ sorted_measurements = merge_and_sort_measurements(measurements_cell, station_nam
     stations, 'residual');
 
 % Plot range and range-rate measurements
-figure(2);
+gca2 = figure(2);
 set(gcf, 'Position', [100, 100, 1400, 900]);
 subplot(2, 1, 1);
 hold on;
@@ -180,6 +182,8 @@ ylabel('Range-Rate Residual (km/s)', 'Interpreter', 'latex', 'FontSize', 14);
 legend('Location', 'northeast', 'FontSize', 8, 'Interpreter', 'latex');
 grid on;
 hold off;
+exportgraphics(gca2, 'Radiometric_Residuals.pdf', 'ContentType','image',...
+    'Resolution', 1000);
 
 %% Esimation - LKF
 
@@ -215,11 +219,12 @@ sigma_vel = 1e-3;    % Std for velocity states (km/s)
 P0 = diag([sigma_pos^2, sigma_pos^2, sigma_pos^2, ...
            sigma_vel^2, sigma_vel^2, sigma_vel^2]);
 
-% Run the Linearized Kalman Filter
-results = batch_filter(trajectory_ref, sorted_measurements, P0);
+% Run the Filter (LKF, Batch, or EKF)
+results = ekf(trajectory_ref, sorted_measurements, P0);
+filename_suffix = 'EKF';
 
 % Print Results
-compute_rms_errors(results)
+compute_rms_errors(results, trajectory_true, sorted_measurements)
 
 %% Plot filtering results
 
@@ -248,7 +253,7 @@ end
 measurement_times_hours = measurement_times / 3600; 
 
 % Plot state error
-figure(4);
+gca4 = figure(4);
 set(gcf, 'Position', [100, 100, 1400, 900]);
 colors = lines(6);
 labels = {'$x$', '$y$', '$z$', '$\dot{x}$', '$\dot{y}$', '$\dot{z}$'};
@@ -268,9 +273,11 @@ for i = 1:6
     grid on;
     hold off;
 end
+exportgraphics(gca4, sprintf('StateErrors_%s.pdf', filename_suffix), ...,
+    'ContentType','image', 'Resolution', 1000);
 
 % Plot state errors in semilogy
-figure(5);
+gca5 = figure(5);
 set(gcf, 'Position', [100, 100, 1400, 900]);
 for i = 1:6
     subplot(2,3,i);    
@@ -287,9 +294,11 @@ for i = 1:6
     grid on;
     hold off;
 end
+exportgraphics(gca5, sprintf('StateErrorsLog_%s.pdf', filename_suffix), ...,
+    'ContentType','image', 'Resolution', 1000);
 
 % Plot range and range-rate post-fit residuals 
-figure(6);
+gca6 = figure(6);
 set(gcf, 'Position', [100, 100, 1400, 900]);
 subplot(2,1,1);
 hold on;
@@ -319,6 +328,8 @@ legend('show', 'Interpreter', 'latex', 'FontSize', 14);
 grid on;
 hold off;
 ylim([-5 * sigma_rho_dot, 5 * sigma_rho_dot]);
+exportgraphics(gca6, sprintf('PostFit_%s.pdf', filename_suffix), ...,
+    'ContentType','image', 'Resolution', 1000);
 
 
 %% Helper Functions Dynamics
@@ -935,18 +946,30 @@ function results = batch_filter(trajectory_ref, sorted_measurements, P0)
         'postfit_residuals', postfit_residuals ...
     );
 end
-
-function compute_rms_errors(results)
-    % Extract state deviations and post-fit residuals
-    state_errors = results.state_deviation_hist;  % (6 x T)
-    postfit_res = results.postfit_residuals;      % (m x T)
+function compute_rms_errors(results, trajectory_true, sorted_measurements)
+    % Extract measurement times
+    measurement_times = [sorted_measurements.time];
+    trajectory_times = [trajectory_true.time];
     
+    % Find indices of true trajectory corresponding to measurement times
+    [~, traj_indices] = ismember(measurement_times, trajectory_times);
+    
+    % Extract true states at measurement times
+    true_states_at_meas = zeros(6, length(measurement_times));
+    for i = 1:length(measurement_times)
+        true_states_at_meas(:, i) = trajectory_true(traj_indices(i)).state(1:6);
+    end
+
+    % Compute state errors (only at measurement times)
+    state_errors = true_states_at_meas - results.state_corrected_hist; % (6 x T)
+    postfit_res = results.postfit_residuals; % (m x T)
+
     % Number of time steps
     T = size(state_errors, 2);
-    
+
     % Compute RMS for each state component
     rms_state = sqrt(mean(state_errors.^2, 2));
-    
+
     % Compute 3D RMS Position and Velocity Errors
     rms_pos_3D = sqrt(mean(sum(state_errors(1:3, :).^2, 1)));
     rms_vel_3D = sqrt(mean(sum(state_errors(4:6, :).^2, 1)));
@@ -974,7 +997,7 @@ function compute_rms_errors(results)
     end
 
     % Ignore first pass (remove first N points)
-    N_ignore = round(T * 0.1); % Example: Ignore first 10% of data
+    N_ignore = round(T * 0.05); % Example: Ignore first 5% of data
     state_errors_trimmed = state_errors(:, N_ignore+1:end);
     postfit_res_trimmed = postfit_res(:, N_ignore+1:end);
 
@@ -1119,7 +1142,3 @@ function results = ekf(trajectory_ref, sorted_measurements, P0)
         'postfit_residuals', postfit_residuals ...
     );
 end
-
-
-
-
