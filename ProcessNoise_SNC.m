@@ -3,7 +3,7 @@
 % DATE:         January 22, 2024
 % CLASS:        ASEN 6080: StatOD
 % INSTRUCTOR:   Prof. Jay W. Mcmahon
-% ASSIGNMENT:   Homework 2 - J3 Mismatch 
+% ASSIGNMENT:   Homework 3 - J3 Mismatch, SNC
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 clear; clc; close;
 
